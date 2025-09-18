@@ -9,11 +9,9 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 from bson.objectid import ObjectId
 from flask_mail import Mail, Message
-import math 
+import math
 from google.oauth2 import id_token
-from google.auth.transport import requests  
 from google.auth.transport import requests as grequests
-
 
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
 if os.path.exists(dotenv_path):
@@ -26,38 +24,33 @@ app = Flask(__name__)
 # Get the MongoDB URI from environment variables
 MONGO_URI = os.getenv("MONGO_URI")
 SECRET_KEY = os.getenv("SECRET_KEY")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")    
 
 # Check if the MONGO_URI is set
 if not MONGO_URI:
     raise RuntimeError("MONGO_URI is not set in the environment variables.")
 
-app.config["MONGO_URI"] = MONGO_URI
-app.config["SECRET_KEY"] = SECRET_KEY
-app.config['MAIL_SERVER'] = os.getenv('MAIL_SERVER')
-app.config['MAIL_PORT'] = int(os.getenv('MAIL_PORT', 465))
-app.config['MAIL_USERNAME'] = os.getenv('MAIL_USERNAME')
-app.config['MAIL_PASSWORD'] = os.getenv('MAIL_PASSWORD')
-app.config['MAIL_USE_TLS'] = os.getenv('MAIL_USE_TLS', 'false').lower() in ['true', '1']
-app.config['MAIL_USE_SSL'] = os.getenv('MAIL_USE_SSL', 'true').lower() in ['true', '1']
+app.config.from_mapping(
+    MONGO_URI=MONGO_URI,
+    SECRET_KEY=SECRET_KEY,
+    MAIL_SERVER=os.getenv('MAIL_SERVER'),
+    MAIL_PORT=int(os.getenv('MAIL_PORT', 465)),
+    MAIL_USERNAME=os.getenv('MAIL_USERNAME'),
+    MAIL_PASSWORD=os.getenv('MAIL_PASSWORD'),
+    MAIL_USE_TLS=os.getenv('MAIL_USE_TLS', 'false').lower() in ['true', '1'],
+    MAIL_USE_SSL=os.getenv('MAIL_USE_SSL', 'true').lower() in ['true', '1']
+)
 
-# --- INITIALIZE EXTENSIONS ---
-try:
-    mongo = PyMongo(app)
-    # Check if the connection is successful by trying to access a collection
-    # This will raise an exception if the connection fails
-    mongo.db.list_collection_names() 
-    print("MongoDB connection successful.")
-except Exception as e:
-    print(f"Error connecting to MongoDB: {e}")
-    mongo = None # Ensure mongo is None if connection fails
-
-# --- INITIALIZE EXTENSIONS ---
-# mongo = PyMongo(app)
+mongo = PyMongo(app)
 bcrypt = Bcrypt(app)
-CORS(app) # Enable Cross-Origin Resource Sharing
+CORS(app)
 mail = Mail(app)
 
-GOOGLE_CLIENT_ID = "305274803308-k2emdcf4q5m7547r4qc1tb758qmpb7l5.apps.googleusercontent.com"
+try:
+    mongo.db.list_collection_names()
+    print("MongoDB connection successful.")
+except Exception as e:
+    print(f"FATAL: Error connecting to MongoDB: {e}")
 
 
 alerts_sent_for_user = {}
@@ -176,30 +169,58 @@ def signin():
 
     return jsonify({'message': 'Invalid email or password'}), 401
 
-# --- NEW: Google Authentication Route ---
+# --- CORRECTED AND COMPLETE GOOGLE AUTH ROUTE ---
 @app.route('/api/auth/google', methods=['POST'])
 def google_auth():
-    # The frontend will send JSON {credential: "<id-token>"}
-    token = request.json.get('credential')
-    if not token:
-        return jsonify({"message": "Missing token"}), 400
+    data = request.get_json()
+    idToken = data.get('token') # Frontend sends the token with the key "token"
+    
+    if not idToken:
+        return jsonify({'message': 'Missing token'}), 400
 
     try:
-        # Verify the token
-        idinfo = id_token.verify_oauth2_token(token, grequests.Request(), GOOGLE_CLIENT_ID)
-        # idinfo now contains the user’s info (email, name, sub (Google user id))
-        google_user_id = idinfo['sub']
-        email = idinfo.get('email')
-        name = idinfo.get('name')
+        # Verify the token with Google, using the Client ID from our .env file
+        idinfo = id_token.verify_oauth2_token(idToken, grequests.Request(), GOOGLE_CLIENT_ID)
 
-        # TODO: check if this email/user already exists in your DB; create or log in
-        # then generate your own JWT and return it to the frontend:
+        email = idinfo['email']
+        name = idinfo['name']
+        google_id = idinfo['sub']
+
+        # Check if user already exists in our database
+        user = mongo.db.users.find_one({'email': email})
+
+        if not user:
+            # If user doesn't exist, create a new account for them
+            print(f"New user {email} signed up via Google.")
+            # Use their email as a placeholder username, or generate one
+            username = email.split('@')[0] + "_g" 
+            user_id = mongo.db.users.insert_one({
+                'name': name,
+                'email': email,
+                'username': username,
+                'googleId': google_id,
+                'password': None # No password needed for Google users
+            }).inserted_id
+            user = mongo.db.users.find_one({'_id': user_id})
+        else:
+            print(f"Existing user {email} logged in via Google.")
+
+        # Generate our application's access token for the user
+        app_token = jwt.encode({
+            'user_id': str(user['_id']),
+            'exp': datetime.utcnow() + timedelta(hours=24)
+        }, app.config['SECRET_KEY'], algorithm="HS256")
+
         return jsonify({
-            "access_token": "your-own-jwt-here",
-            "user": {"name": name, "email": email}
+            'message': 'Google login successful',
+            'access_token': app_token
         })
+
     except ValueError:
-        return jsonify({"message": "Invalid Google token"}), 401
+        # This catches invalid tokens
+        return jsonify({'message': 'Invalid Google token'}), 401
+    except Exception as e:
+        return jsonify({'message': 'An unexpected error occurred', 'error': str(e)}), 500
 
 
 # --- PROTECTED ROUTES ---
@@ -223,6 +244,8 @@ def generate_id(current_user):
         'received_data': id_data
     })
 
+# --- DIGITAL ID ROUTES ---
+
 @app.route('/api/id/save', methods=['POST'])
 @token_required
 def save_digital_id(current_user):
@@ -244,11 +267,11 @@ def fetch_digital_id(current_user):
     """Fetches the saved digital ID data for the current user."""
     user = mongo.db.users.find_one({'_id': ObjectId(current_user['_id'])})
     
-    # Check if the 'digitalId' field exists and return it
+    # Check if the 'digitalId' field exists in the user's document and return it
     if user and 'digitalId' in user:
         return jsonify({'digitalId': user['digitalId']}), 200
     else:
-        # If no ID is found, return a null or empty object
+        # If no ID is found, return a 404 error
         return jsonify({'digitalId': None}), 404
 
 
@@ -257,7 +280,7 @@ def fetch_digital_id(current_user):
 def delete_digital_id(current_user):
     """Deletes the digital ID data from the current user's document."""
     
-    # We use '$unset' to completely remove the 'digitalId' field
+    # We use '$unset' to completely remove the 'digitalId' field from the document
     mongo.db.users.update_one(
         {'_id': ObjectId(current_user['_id'])},
         {'$unset': {'digitalId': ""}}
@@ -350,7 +373,57 @@ def reset_alerts(current_user):
     alerts_sent_for_user = {} # This clears the dictionary
     print("Alert memory has been reset.")
     return jsonify({'message': 'Alert memory has been reset'}), 200
+# --- FEEDBACK ROUTES ---
 
+@app.route('/api/feedback', methods=['GET'])
+def get_feedback():
+    """Fetches all feedback, can be filtered by place."""
+    query = {}
+    place = request.args.get('place')
+    if place:
+        query['placeName'] = {'$regex': place, '$options': 'i'}
+
+    feedbacks_cursor = mongo.db.feedback.find(query).sort('createdAt', -1)
+    feedbacks = []
+    
+    for feedback in feedbacks_cursor:
+        # --- FIX: Convert all special BSON types to strings ---
+        feedback['_id'] = str(feedback['_id'])
+        
+        # Convert the authorId from ObjectId to string
+        if 'authorId' in feedback:
+            feedback['authorId'] = str(feedback['authorId'])
+            
+        # Convert the createdAt from a datetime object to a string
+        if 'createdAt' in feedback:
+            feedback['createdAt'] = feedback['createdAt'].isoformat()
+            
+        feedbacks.append(feedback)
+        
+    return jsonify(feedbacks), 200
+
+
+@app.route('/api/feedback', methods=['POST'])
+@token_required
+def post_feedback(current_user):
+    """Allows a logged-in user to post new feedback."""
+    data = request.get_json()
+    text = data.get('text')
+    place_name = data.get('placeName')
+
+    if not text or not place_name:
+        return jsonify({'message': 'Feedback text and place name are required'}), 400
+
+    feedback_document = {
+        'authorUsername': current_user['username'],
+        'authorId': ObjectId(current_user['_id']),
+        'text': text,
+        'placeName': place_name,
+        'createdAt': datetime.utcnow()
+    }
+    mongo.db.feedback.insert_one(feedback_document)
+    
+    return jsonify({'message': 'Feedback submitted successfully'}), 201
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
