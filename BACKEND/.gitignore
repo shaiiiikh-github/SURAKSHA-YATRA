@@ -1,0 +1,35 @@
+# Secret environment variables
+# This is the most important rule to keep your passwords and keys safe.
+.env
+.env.local
+
+# Frontend (React / Vite / Node.js)
+# The massive folder of downloaded packages.
+node_modules/
+
+# The folder created when you build your app for production.
+dist/
+build/
+
+# Log files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+
+# Backend (Python)
+# The virtual environment folder.
+venv/
+/backend/venv/
+
+# Python's temporary cache files.
+__pycache__/
+*.pyc
+
+
+# IDE and System Files
+# Files created by your code editor or operating system.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db3
